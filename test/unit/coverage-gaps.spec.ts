@@ -186,6 +186,26 @@ describe('RequestService — coverage gaps', () => {
     );
   });
 
+  it('HCM transient error defaults retry count from undefined', async () => {
+    const req = mkRequest({ hcm_retry_count: undefined as any, status: RequestStatus.PENDING_HCM });
+    requestRepo.createQueryBuilder.mockReturnValue({
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue([req]),
+    });
+    employeeRepo.findOne.mockResolvedValue(mkEmployee());
+    locationRepo.findOne.mockResolvedValue(mkLocation());
+    hcmClient.submitRequest.mockRejectedValue(new Error('timeout'));
+
+    await service.retryStuckSubmissions();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(requestRepo.update).toHaveBeenCalledWith(
+      'req-1',
+      expect.objectContaining({ hcm_retry_count: 1 }),
+    );
+  });
+
   it('findAll with no filters returns all requests', async () => {
     requestRepo.find.mockResolvedValue([mkRequest()]);
     const results = await service.findAll({});
@@ -270,5 +290,20 @@ describe('SyncService — triggerPull coverage', () => {
       ],
     });
     expect(job.records_total).toBe(2);
+  });
+
+  it('enqueueBatch logs processing error when processBatch crashes before try/catch', async () => {
+    const loggerSpy = jest.spyOn((service as any).logger, 'error').mockImplementation(() => undefined);
+    jobRepo.update.mockRejectedValueOnce(new Error('db write failed'));
+
+    await service.enqueueBatch({
+      batchId: `batch-crash-${Date.now()}`,
+      generatedAt: new Date().toISOString(),
+      records: [{ employeeExternalId: 'EMP001', locationExternalId: 'LOC-US', totalDays: 20 }],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(loggerSpy).toHaveBeenCalledWith(expect.stringContaining('processing error'));
+    loggerSpy.mockRestore();
   });
 });

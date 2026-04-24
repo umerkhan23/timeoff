@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { HttpException } from '@nestjs/common';
+import axios from 'axios';
 import nock from 'nock';
 import { HcmClientService } from '../../../src/modules/hcm-client/hcm-client.service';
 
@@ -102,6 +103,11 @@ describe('HcmClientService — unit', () => {
       nock(BASE).post('/hcm/requests').replyWithError('connect ECONNREFUSED');
       await expect(service.submitRequest(payload)).rejects.toThrow();
     });
+
+    it('throws HttpException when HCM submit returns 503 response', async () => {
+      nock(BASE).post('/hcm/requests').reply(503, { message: 'Service unavailable' });
+      await expect(service.submitRequest(payload)).rejects.toThrow(HttpException);
+    });
   });
 
   // ─────────────────────────────────────────────
@@ -147,5 +153,32 @@ describe('HcmClientService — unit', () => {
       const result = await service.triggerBatchPull(['EMP001']);
       expect(result.balances).toHaveLength(1);
     });
+
+    it('throws HttpException when trigger batch pull returns 500', async () => {
+      nock(BASE).post('/hcm/batch').reply(500, { message: 'Upstream exploded' });
+      await expect(service.triggerBatchPull()).rejects.toThrow(HttpException);
+    });
+  });
+
+  it('rethrows non-Axios errors unchanged', () => {
+    const err = new Error('plain error');
+    expect(() => (service as any).rethrow(err, 'customOp')).toThrow('plain error');
+  });
+
+  it('submitRequest handles non-Axios thrown errors via rethrow path', async () => {
+    const postSpy = jest.spyOn((service as any).http, 'post').mockRejectedValueOnce(new Error('plain submit error'));
+    const axiosTypeSpy = jest.spyOn(axios, 'isAxiosError').mockReturnValue(false);
+
+    await expect(service.submitRequest({
+      employeeExternalId: 'EMP001',
+      locationExternalId: 'LOC-US',
+      startDate: '2025-08-01',
+      endDate: '2025-08-02',
+      durationDays: 1,
+      referenceId: 'ref-plain',
+    })).rejects.toThrow('plain submit error');
+
+    axiosTypeSpy.mockRestore();
+    postSpy.mockRestore();
   });
 });

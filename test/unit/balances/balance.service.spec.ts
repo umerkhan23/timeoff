@@ -156,6 +156,18 @@ describe('BalanceService — unit', () => {
       expect(mockRunner.query).toHaveBeenCalledTimes(2); // 1 call per attempt
     });
 
+    it('treats missing affected count as conflict and retries', async () => {
+      const bal = mkBalance({ total_days: 10, reserved_days: 0, used_days: 0 });
+      balanceRepo.findOne.mockResolvedValue(bal);
+      mockRunner.query.mockResolvedValue({}); // affected undefined => 0
+
+      const result = await service.reserve('emp-1', 'loc-1', 5, 'req-1');
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('CONFLICT');
+      expect(mockRunner.query).toHaveBeenCalledTimes(3);
+    });
+
     it('returns CONFLICT after exhausting all retries', async () => {
       const bal = mkBalance({ total_days: 10, reserved_days: 0, used_days: 0 });
       balanceRepo.findOne.mockResolvedValue(bal);
@@ -221,6 +233,18 @@ describe('BalanceService — unit', () => {
 
       expect(savedBal.reserved_days).toBe(0);
     });
+
+    it('returns early when no balance exists inside release transaction', async () => {
+      dataSource.transaction.mockImplementation(async (fn) => {
+        const mgr = { findOne: jest.fn().mockResolvedValue(null), save: jest.fn() };
+        return fn(mgr);
+      });
+      balanceRepo.findOne.mockResolvedValue(null);
+
+      await service.release('emp-missing', 'loc-missing', 1, 'req-404');
+
+      expect(auditService.log).not.toHaveBeenCalled();
+    });
   });
 
   // ──────────────────────────────────────────
@@ -242,6 +266,24 @@ describe('BalanceService — unit', () => {
 
       expect(saved.reserved_days).toBe(0);
       expect(saved.used_days).toBe(5);
+    });
+
+    it('throws NotFoundException when commit target balance does not exist', async () => {
+      dataSource.transaction.mockImplementation(async (fn) => {
+        const mgr = { findOne: jest.fn().mockResolvedValue(null), save: jest.fn() };
+        return fn(mgr);
+      });
+      await expect(service.commit('emp-1', 'loc-1', 1, 'req-1')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('decommit', () => {
+    it('throws NotFoundException when decommit target balance does not exist', async () => {
+      dataSource.transaction.mockImplementation(async (fn) => {
+        const mgr = { findOne: jest.fn().mockResolvedValue(null), save: jest.fn() };
+        return fn(mgr);
+      });
+      await expect(service.decommit('emp-1', 'loc-1', 1, 'req-1')).rejects.toThrow(NotFoundException);
     });
   });
 
@@ -292,6 +334,35 @@ describe('BalanceService — unit', () => {
 
       expect(saved.total_days).toBe(25);
       expect(result.conflicted).toBe(false);
+    });
+
+    it('updates reserved_days and used_days when provided from HCM', async () => {
+      const existing = mkBalance({ total_days: 20, reserved_days: 0, used_days: 0, version: 1 });
+      let saved: any;
+      dataSource.transaction.mockImplementation(async (fn) => {
+        const mgr = {
+          findOne: jest.fn().mockResolvedValue(existing),
+          create: jest.fn().mockImplementation((_, d) => d),
+          save: jest.fn().mockImplementation((Entity, b) => {
+            if (b && b.total_days !== undefined) saved = b;
+            return Promise.resolve(b ?? {});
+          }),
+          find: jest.fn().mockResolvedValue([]),
+        };
+        return fn(mgr);
+      });
+
+      await service.upsertFromHcm({
+        employeeId: 'emp-1',
+        locationId: 'loc-1',
+        totalDays: 25,
+        reservedDays: 3,
+        usedDays: 4,
+        source: AuditSource.HCM_BATCH,
+      });
+
+      expect(saved.reserved_days).toBe(3);
+      expect(saved.used_days).toBe(4);
     });
 
     it('flags active requests as NEEDS_REVIEW when HCM reduces balance below reserved', async () => {

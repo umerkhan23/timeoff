@@ -113,6 +113,25 @@ describe('SyncService — unit', () => {
 
       expect(result.conflicted).toBe(true);
     });
+
+    it('passes reservedDays and usedDays when provided in realtime payload', async () => {
+      employeeRepo.findOne.mockResolvedValue(mkEmployee());
+      locationRepo.findOne.mockResolvedValue(mkLocation());
+      balanceService.upsertFromHcm.mockResolvedValue({ balance: {}, conflicted: false });
+
+      await service.handleRealtimePush({
+        employeeExternalId: 'EMP001',
+        locationExternalId: 'LOC-US',
+        totalDays: 25,
+        reservedDays: 2,
+        usedDays: 3,
+      });
+
+      expect(balanceService.upsertFromHcm).toHaveBeenCalledWith(expect.objectContaining({
+        reservedDays: 2,
+        usedDays: 3,
+      }));
+    });
   });
 
   // ─────────────────────────────────────────────
@@ -192,6 +211,42 @@ describe('SyncService — unit', () => {
       );
     });
 
+    it('marks job FAILED if any record has negative reservedDays', async () => {
+      const payload = {
+        ...validPayload(),
+        records: [{ employeeExternalId: 'EMP001', locationExternalId: 'LOC-US', totalDays: 5, reservedDays: -1 }],
+      };
+
+      await service.enqueueBatch(payload as any);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(jobRepo.update).toHaveBeenCalledWith(
+        'job-new',
+        expect.objectContaining({
+          status: SyncJobStatus.FAILED,
+          error_detail: expect.stringContaining('Negative reservedDays'),
+        }),
+      );
+    });
+
+    it('marks job FAILED if any record has negative usedDays', async () => {
+      const payload = {
+        ...validPayload(),
+        records: [{ employeeExternalId: 'EMP001', locationExternalId: 'LOC-US', totalDays: 5, usedDays: -1 }],
+      };
+
+      await service.enqueueBatch(payload as any);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(jobRepo.update).toHaveBeenCalledWith(
+        'job-new',
+        expect.objectContaining({
+          status: SyncJobStatus.FAILED,
+          error_detail: expect.stringContaining('Negative usedDays'),
+        }),
+      );
+    });
+
     it('marks job FAILED if location external_id is unknown', async () => {
       locationRepo.findOne.mockResolvedValue(null);
 
@@ -230,6 +285,27 @@ describe('SyncService — unit', () => {
     it('throws BadRequestException for non-existent job', async () => {
       jobRepo.findOne.mockResolvedValue(null);
       await expect(service.getJobStatus('bad-id')).rejects.toThrow(BadRequestException);
+    });
+  });
+
+  describe('triggerPull', () => {
+    it('returns existing job when enqueueBatch collides with duplicate batchId', async () => {
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1234567890);
+      hcmClient.triggerBatchPull.mockResolvedValue({
+        balances: [{ employeeExternalId: 'EMP001', locationExternalId: 'LOC-US', totalDays: 20, reservedDays: 1, usedDays: 2 }],
+        generatedAt: new Date().toISOString(),
+      });
+      const existing = mkJob({ id: 'job-existing', batch_id: 'pull-1234567890' });
+      jobRepo.findOne
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(existing);
+      jobRepo.save.mockRejectedValueOnce(new ConflictException('duplicate'));
+
+      const result = await service.triggerPull(['EMP001']);
+
+      expect(result.jobId).toBe('job-existing');
+      expect(hcmClient.triggerBatchPull).toHaveBeenCalledWith(['EMP001']);
+      nowSpy.mockRestore();
     });
   });
 });

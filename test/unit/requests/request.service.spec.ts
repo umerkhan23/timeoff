@@ -137,6 +137,23 @@ describe('RequestService — unit', () => {
       })).rejects.toThrow(NotFoundException);
     });
 
+    it('throws NotFoundException when location does not exist', async () => {
+      employeeRepo.findOne.mockResolvedValue(mkEmployee());
+      locationRepo.findOne.mockResolvedValue(null);
+      await expect(service.submit({
+        employeeId: 'emp-1', locationId: 'loc-X',
+        startDate: '2025-08-01', endDate: '2025-08-05', durationDays: 5,
+      })).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws NotFoundException when reservation returns NOT_FOUND', async () => {
+      balanceService.reserve.mockResolvedValue({ success: false, errorCode: 'NOT_FOUND' });
+      await expect(service.submit({
+        employeeId: 'emp-1', locationId: 'loc-1',
+        startDate: '2025-08-01', endDate: '2025-08-05', durationDays: 5,
+      })).rejects.toThrow(NotFoundException);
+    });
+
     it('throws BadRequestException when end_date < start_date', async () => {
       await expect(service.submit({
         employeeId: 'emp-1', locationId: 'loc-1',
@@ -150,6 +167,59 @@ describe('RequestService — unit', () => {
         startDate: '2025-08-01', endDate: '2025-08-01', durationDays: 1,
       });
       expect(result.status).toBe(RequestStatus.PENDING_LOCAL);
+    });
+
+    it('throws BadRequestException for invalid date format', async () => {
+      await expect(service.submit({
+        employeeId: 'emp-1', locationId: 'loc-1',
+        startDate: 'invalid-date', endDate: '2025-08-01', durationDays: 1,
+      })).rejects.toThrow(BadRequestException);
+    });
+
+    it('logs async failure when pre-HCM status update fails', async () => {
+      const loggerErrorSpy = jest.spyOn((service as any).logger, 'error').mockImplementation(() => undefined);
+      requestRepo.update.mockRejectedValueOnce(new Error('db update failed'));
+
+      await service.submit({
+        employeeId: 'emp-1', locationId: 'loc-1',
+        startDate: '2025-08-01', endDate: '2025-08-05', durationDays: 5,
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(loggerErrorSpy).toHaveBeenCalledWith(expect.stringContaining('Async HCM submission failed'));
+      loggerErrorSpy.mockRestore();
+    });
+
+    it('sets hcm_error from errorCode when HCM rejects without errorMessage', async () => {
+      hcmClient.submitRequest.mockResolvedValueOnce({ status: 'REJECTED', errorCode: 'INVALID_DIMENSION' });
+      requestRepo.update.mockResolvedValue({});
+
+      await service.submit({
+        employeeId: 'emp-1', locationId: 'loc-1',
+        startDate: '2025-08-01', endDate: '2025-08-05', durationDays: 5,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(requestRepo.update).toHaveBeenCalledWith(
+        'req-1',
+        expect.objectContaining({ hcm_error: 'INVALID_DIMENSION' }),
+      );
+    });
+
+    it('sets fallback HCM_REJECTED when reject has no error fields', async () => {
+      hcmClient.submitRequest.mockResolvedValueOnce({ status: 'REJECTED' });
+      requestRepo.update.mockResolvedValue({});
+
+      await service.submit({
+        employeeId: 'emp-1', locationId: 'loc-1',
+        startDate: '2025-08-01', endDate: '2025-08-05', durationDays: 5,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(requestRepo.update).toHaveBeenCalledWith(
+        'req-1',
+        expect.objectContaining({ hcm_error: 'HCM_REJECTED' }),
+      );
     });
   });
 
@@ -278,6 +348,24 @@ describe('RequestService — unit', () => {
     it('throws BadRequestException when cancelling a REJECTED request', async () => {
       requestRepo.findOne.mockResolvedValue(mkRequest({ status: RequestStatus.REJECTED, employee_id: 'emp-1' }));
       await expect(service.cancel('req-1', 'emp-1')).rejects.toThrow(BadRequestException);
+    });
+
+    it('still cancels locally even if HCM cancel fails during cancel()', async () => {
+      const loggerWarnSpy = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
+      const req = mkRequest({
+        status: RequestStatus.PENDING_APPROVAL,
+        employee_id: 'emp-1',
+        hcm_reference_id: 'HCM-000002',
+      });
+      requestRepo.findOne
+        .mockResolvedValueOnce(req)
+        .mockResolvedValueOnce({ ...req, status: RequestStatus.CANCELLED });
+      requestRepo.update.mockResolvedValue({});
+      hcmClient.cancelRequest.mockRejectedValueOnce(new Error('network timeout'));
+
+      await expect(service.cancel('req-1', 'emp-1')).resolves.not.toThrow();
+      expect(loggerWarnSpy).toHaveBeenCalledWith(expect.stringContaining('HCM cancel failed'));
+      loggerWarnSpy.mockRestore();
     });
   });
 });
