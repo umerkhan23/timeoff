@@ -4,3 +4,4 @@ coverage/
 *.db
 .env
 *.js.map
+package-lock.json
